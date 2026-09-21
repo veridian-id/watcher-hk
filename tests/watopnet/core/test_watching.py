@@ -5,6 +5,7 @@ KERI
 testing watopnet.core.watching package
 
 """
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +13,14 @@ from keri import kering
 from keri.app import habbing
 from keri.core import eventing
 from watopnet.core import basing
-from watopnet.app.watching import Sentinal, States, Watcher, Watchery
+from watopnet.app.watching import (
+    CueDoer,
+    ResponseDoer,
+    Sentinal,
+    States,
+    Watcher,
+    Watchery,
+)
 
 
 def test_adding_watched(mockHelpingNowUTC):
@@ -340,3 +348,74 @@ def test_sentinal_pins_unresolved_witness_endpoint_without_crashing(monkeypatch)
     assert query.response_received is False
     assert query.state == States.unresponsive
     assert query.error == "Missing witness endpoint: unable to find a valid endpoint for witness=WIT_1"
+
+
+def test_watcher_pushes_ksn_for_observed_aid(mockHelpingNowUTC):
+    with (
+        habbing.openHab(name="bob", salt=b"0123456789fedbob") as (bobHby, bobHab),
+        habbing.openHab(name="eve", salt=b"0123456789fedeve") as (eveHby, eveHab),
+        habbing.openHab(name="wan", transferable=False, salt=b"0123456789fedcba") as (
+            watHby,
+            watHab,
+        ),
+    ):
+        db = basing.Baser(name="wan", temp=True)
+        wty = Watchery(db=db, temp=True)
+        watcher = Watcher(wty=wty, db=db, hby=watHby, hab=watHab, cid=bobHab.pre)
+
+        cueDoer = next(d for d in watcher.doers if isinstance(d, CueDoer))
+        responseDoer = next(d for d in watcher.doers if isinstance(d, ResponseDoer))
+
+        watcher.psr.parseOne(bobHab.makeOwnInception())
+
+        add = eventing.reply(
+            route=f"/watcher/{watHab.pre}/add",
+            data=dict(
+                cid=bobHab.pre, oid=eveHab.pre, oobi="http://localhost:2701/oobi"
+            ),
+        )
+        watcher.psr.parseOne(bobHab.endorse(add))
+        assert watHby.db.obvs.get(keys=(bobHab.pre, watHab.pre, eveHab.pre)).enabled
+
+        watcher.psr.parseOne(eveHab.makeOwnInception())
+
+        cueDoer.recur()
+        responseDoer.recur()
+
+        assert len(watcher.poster.evts) == 1
+        evt = watcher.poster.evts.popleft()
+        assert evt["dest"] == bobHab.pre
+        assert evt["topic"] == "reply"
+        assert evt["hab"] is watHab
+        assert evt["serder"].ked["r"] == f"/ksn/{watHab.pre}"
+        assert evt["serder"].ked["a"]["i"] == eveHab.pre
+        assert evt["serder"].ked["a"]["d"] == eveHab.kever.serder.said
+        assert evt["attachment"]
+
+
+def test_watcher_drops_response_for_unresolved_dest(mockHelpingNowUTC):
+    with (
+        habbing.openHab(name="bob", salt=b"0123456789fedbob") as (bobHby, bobHab),
+        habbing.openHab(name="eve", salt=b"0123456789fedeve") as (eveHby, eveHab),
+        habbing.openHab(name="wan", transferable=False, salt=b"0123456789fedcba") as (
+            watHby,
+            watHab,
+        ),
+    ):
+        db = basing.Baser(name="wan", temp=True)
+        wty = Watchery(db=db, temp=True)
+        watcher = Watcher(wty=wty, db=db, hby=watHby, hab=watHab, cid=bobHab.pre)
+
+        responseDoer = next(d for d in watcher.doers if isinstance(d, ResponseDoer))
+
+        rpy = eventing.reply(
+            route=f"/ksn/{watHab.pre}", data=asdict(eveHab.kever.state())
+        )
+        watcher.responses.append(
+            dict(kin="reply", src=watHab.pre, dest=bobHab.pre, serder=rpy)
+        )
+
+        responseDoer.recur()
+
+        assert not watcher.responses
+        assert not watcher.poster.evts

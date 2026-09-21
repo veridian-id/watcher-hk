@@ -20,9 +20,9 @@ from hio.core import http
 from hio.help import decking
 from keri import help
 from keri import kering
-from keri.app import configing, indirecting, habbing, agenting, querying
+from keri.app import configing, indirecting, habbing, agenting, forwarding, querying
 from keri.app.oobiing import Oobiery
-from keri.core import coring, Salter, routing, eventing, parsing
+from keri.core import coring, Salter, routing, eventing, parsing, serdering
 from keri.db.basing import OobiRecord, BaserDoer
 from keri.help import helping
 from keri.peer import exchanging
@@ -360,6 +360,7 @@ class Watcher(doing.DoDoer):
         self.hby = hby
         self.hab = hab
         self.cues = decking.Deck()
+        self.responses = decking.Deck()
 
         self.rtr = routing.Router()
         self.rvy = routing.Revery(
@@ -400,6 +401,8 @@ class Watcher(doing.DoDoer):
         )
 
         self.oobiery = Oobiery(self.hby, rvy=self.rvy)
+        self.poster = forwarding.Poster(hby=self.hby)
+
         oobis = self.oobis()
         oobi = oobis[0] if len(oobis) > 0 else None
         doers = [
@@ -407,6 +410,20 @@ class Watcher(doing.DoDoer):
             WatcherStart(hab=self.hab),
             MessageDoer(parser=self.psr),
             EscrowDoer(kvy=self.kvy, rvy=self.rvy, tvy=self.tvy, exc=self.exc),
+            CueDoer(
+                db=self.db,
+                hab=self.hab,
+                aid=self.cid,
+                cues=self.cues,
+                responses=self.responses,
+            ),
+            self.poster,
+            ResponseDoer(
+                hby=self.hby,
+                hab=self.hab,
+                responses=self.responses,
+                poster=self.poster,
+            ),
             SentinalDoer(
                 db=self.db, hby=self.hby, hab=self.hab, cid=self.cid, oobi=oobi
             ),
@@ -699,6 +716,77 @@ class CueDoer(doing.Doer):
                     continue
 
                 self.responses.append(cue)
+
+        return False
+
+
+class ResponseDoer(doing.Doer):
+    """Doer that delivers the responses ``CueDoer`` queues to their destination.
+
+    Each response is endorsed with the watcher's own Hab and handed to
+    ``forwarding.Poster``, which resolves a controller, agent or mailbox end role
+    for the destination and sends the message there.
+    """
+
+    def __init__(self, hby, hab, responses, poster):
+        """
+        Parameters:
+            hby (Habery): KERI keystore environment for this watcher
+            hab (Hab): Hab for this watcher's own AID, used to endorse and send
+            responses (Deck): outgoing response deck filled by ``CueDoer``
+            poster (Poster): keripy forwarding Poster that performs the delivery
+        """
+        self.hby = hby
+        self.hab = hab
+        self.responses = responses
+        self.poster = poster
+
+        super(ResponseDoer, self).__init__()
+
+    def recur(self, tyme=None):
+        """Drain all queued responses and hand each to the Poster."""
+        while self.responses:
+            rep = self.responses.pull()
+            kin = rep["kin"]
+            dest = rep["dest"]
+
+            # Poster resolves the destination's end role out of its KEL, so a dest
+            # whose OOBI the watcher never resolved is undeliverable, not just unrouted.
+            if dest not in self.hby.kevers:
+                logger.info("watcher cannot deliver %s, unknown dest %s", kin, dest)
+                continue
+
+            if kin in ("reply",):
+                serder = rep["serder"]
+                atc = self.hab.endorse(serder=serder, last=False)
+                del atc[: serder.size]
+                self.poster.send(
+                    dest=dest,
+                    topic="reply",
+                    serder=serder,
+                    hab=self.hab,
+                    attachment=atc,
+                )
+
+                logger.info(
+                    "watcher sending %s to %s", serder.ked["r"], dest
+                )
+
+            elif kin in ("replay",):
+                for msg in rep["msgs"]:
+                    raw = bytearray(msg)
+                    serder = serdering.SerderKERI(raw=raw)
+                    del raw[: serder.size]
+                    self.poster.send(
+                        dest=dest,
+                        topic="replay",
+                        serder=serder,
+                        hab=self.hab,
+                        attachment=raw,
+                    )
+
+            else:
+                logger.info("watcher cannot deliver unknown response kind %s", kin)
 
         return False
 
