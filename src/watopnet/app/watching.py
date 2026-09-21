@@ -8,7 +8,9 @@ Core watcher orchestration: dual HTTP server setup, Watchery lifecycle managemen
 per-watcher Doer trees, witness-polling Sentinals, and boot API endpoints.
 """
 import datetime
+import errno
 import json
+import os
 import random
 from collections import namedtuple
 from dataclasses import asdict
@@ -32,6 +34,22 @@ from watopnet.core import basing, httping, oobing
 from watopnet.core.httping import HttpEnd
 
 logger = help.ogler.getLogger()
+
+FD_EXHAUSTION_ERRNOS = {errno.EMFILE, errno.ENFILE}
+
+
+def _isFdExhaustion(exc):
+    """Return True when the exception chain indicates file descriptor exhaustion."""
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno in FD_EXHAUSTION_ERRNOS:
+            return True
+        if "Too many open files" in str(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 Stateage = namedtuple("Stateage", "even ahead behind duplicitous unresponsive")
 States = Stateage(
@@ -229,6 +247,36 @@ class Watchery(doing.DoDoer):
 
         super(Watchery, self).__init__(doers=doers, always=True)
 
+    def _logFdExhaustion(self, aid):
+        """Log process FD state after watcher provisioning hits capacity."""
+        soft = None
+        hard = None
+        try:
+            import resource
+
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        except (ImportError, OSError, ValueError):
+            pass
+
+        count = None
+        for path in ("/proc/self/fd", "/dev/fd"):
+            try:
+                count = sum(1 for name in os.listdir(path) if name.isdigit())
+                break
+            except OSError:
+                continue
+
+        headroom = None
+        if count is not None and soft is not None and 0 <= soft < 2**60:
+            headroom = max(soft - count, 0)
+
+        logger.exception(
+            "Watcher provisioning failed due to file descriptor exhaustion: "
+            f"controller={aid} active_watchers={len(self.wats)} "
+            f"fd_count={count} fd_soft_limit={soft} fd_hard_limit={hard} "
+            f"fd_headroom={headroom}"
+        )
+
     def reload(self):
         """Load all watcher records from the database and instantiate Watcher doers."""
         for said, wat in self.db.wats.getItemIter():
@@ -327,14 +375,14 @@ class Watchery(doing.DoDoer):
                 f"Unable to delete watcher, {eid} is not a valid watcheridentifier"
             )
 
-        watcher = self.wats[eid]
+        watcher = self.wats.pop(eid)
 
         cid = watcher.cid
         self.db.wats.rem(keys=(eid,))
         self.db.cids.rem(keys=(eid, cid))
-        watcher.hby.close(clear=True)
-
+        # stop the doers before their database goes away
         self.remove([watcher])
+        watcher.hby.close(clear=True)
 
 
 class Watcher(doing.DoDoer):
@@ -587,7 +635,7 @@ class MessageDoer(doing.Doer):
 
 
 class EscrowDoer(doing.Doer):
-    """Doer that drains pending escrows for all KERI message processors on each tick."""
+    """Doer that periodically drains pending escrows for all KERI message processors."""
 
     def __init__(self, kvy, rvy, tvy, exc=None):
         """
@@ -602,7 +650,8 @@ class EscrowDoer(doing.Doer):
         self.tvy = tvy
         self.exc = exc
 
-        super(EscrowDoer, self).__init__()
+        tock = float(os.getenv("WATOPNET_ESCROW_TOCK", "0.5"))
+        super(EscrowDoer, self).__init__(tock=tock)
 
     def recur(self, tyme=None):
         """Process all pending escrows for kvy, rvy, tvy, and exc."""
@@ -797,7 +846,8 @@ class Sentinal(doing.DoDoer):
     For each witness, issues a KSN query via ``Receiptor.ksn``, then compares the
     returned state against the local KEL using ``diffState``.  Detects even,
     behind, ahead, and duplicitous conditions and logs the results.  Extends
-    itself with a ``SeqNoQuerier`` when witnesses are ahead of the local KEL.
+    itself with a ``SeqNoQuerier`` against an agreeing ahead witness when
+    witnesses are ahead of the local KEL.
 
     Persists per-witness query results to ``Baser.witq`` for later retrieval by
     ``WatcherStatusEnd``.
@@ -903,7 +953,13 @@ class Sentinal(doing.DoDoer):
             mystate = kever.state()
             witstate = self.hby.db.ksns.get((saider.qb64,))
 
-            diffstate = self.diffState(wit, mystate, witstate)
+            try:
+                diffstate = self.diffState(wit, mystate, witstate)
+            except ValueError as ex:
+                # one bad witness reply must not abort the comparison for the rest
+                witQuery.error = f"Invalid key state notice from witness: {ex}"
+                self.db.witq.pin(keys=(self.hab.pre, self.oid, wit), val=witQuery)
+                continue
             witQuery.response_received = True
             witQuery.state = diffstate.state
             witQuery.keystate = witstate
@@ -943,10 +999,12 @@ class Sentinal(doing.DoDoer):
                 )
 
             state = random.choice(ahds)
-            fn = self.hby.kevers[self.oid].sn + 1 if self.oid in self.hby.kevers else 0
+            # replay starts from the first-seen ordinal, which runs past sn after a recovery
+            fn = int(kever.state().f, 16) + 1
 
+            # only an ahead witness has the events we are missing
             qry = querying.SeqNoQuerier(
-                self.hby, self.hab, pre=self.oid, fn=fn, sn=state.sn
+                self.hby, self.hab, pre=self.oid, fn=fn, sn=state.sn, wits=[state.wit]
             )
             self.extend([qry])
 
@@ -977,9 +1035,16 @@ class Sentinal(doing.DoDoer):
         """
         witstate = WitnessState()
         witstate.wit = wit
+        mypre = preksn.i
         mysn = int(preksn.s, 16)
         mydig = preksn.d
-        witstate.sn = int(witksn.f, 16)
+
+        if witksn.i != mypre:
+            raise ValueError(
+                f"can't compare key states from different AIDs {mypre}/{witksn.i}"
+            )
+
+        witstate.sn = int(witksn.s, 16)
         witstate.dig = witksn.d
 
         # At the same sequence number, check the DIGs
@@ -1025,8 +1090,29 @@ class WatcherCollectionEnd:
             rep (Response): Falcon HTTP response object
         """
         body = req.get_media()
+        if not isinstance(body, dict):
+            raise falcon.HTTPBadRequest(
+                description="request body must be a JSON object"
+            )
+
         aid = httping.getRequiredParam(body, "aid")
+        if not isinstance(aid, str):
+            raise falcon.HTTPBadRequest(description="field 'aid' must be a string")
+
         oobi = body.get("oobi")
+        if oobi is not None:
+            if not isinstance(oobi, str):
+                raise falcon.HTTPBadRequest(description="field 'oobi' must be a string")
+
+            splits = urlsplit(oobi)
+            if splits.scheme not in (kering.Schemes.http, kering.Schemes.https):
+                raise falcon.HTTPBadRequest(
+                    description="field 'oobi' must be an http or https URL"
+                )
+            if not splits.netloc:
+                raise falcon.HTTPBadRequest(
+                    description="field 'oobi' must include a network location"
+                )
 
         try:
             prefixer = coring.Prefixer(qb64=aid)
@@ -1039,6 +1125,14 @@ class WatcherCollectionEnd:
             watcher = self.wty.createWatcher(cid=aid)
         except kering.ConfigurationError as e:
             raise falcon.HTTPBadRequest(description=e.args[0])
+        except Exception as e:
+            if not _isFdExhaustion(e):
+                raise
+            self.wty._logFdExhaustion(aid)
+            raise falcon.HTTPServiceUnavailable(
+                title="Watcher service unavailable",
+                description="Watcher service file descriptor capacity exhausted.",
+            ) from e
 
         if oobi:
             watcher.hby.db.oobis.pin(

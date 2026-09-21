@@ -232,8 +232,12 @@ class Throttle(object):
             req (Request): Falcon HTTP request object
             resp (Response): Falcon HTTP response object
         """
-        client = req.access_route[0]
-        ip = client[0]
+        ip = req.remote_addr
+        # hio puts the connection's (host, port) tuple in REMOTE_ADDR
+        if isinstance(ip, tuple):
+            ip = ip[0]
+        if not ip:
+            ip = req.access_route[-1] if req.access_route else "unknown"
         now = helping.nowUTC()
 
         reqs = self.db.ips.get(keys=(ip,))
@@ -250,4 +254,4 @@ class Throttle(object):
             else:
                 reqs = basing.Requests(helping.toIso8601(now), 1)
 
-        self.db.ips.pin(ip, reqs)
+        self.db.ips.pin(keys=(ip,), val=reqs)
