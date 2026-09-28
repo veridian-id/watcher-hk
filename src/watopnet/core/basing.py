@@ -73,11 +73,12 @@ class Requests:
 class Baser(dbing.LMDBer):
     """LMDB database for the Watcher Operational Network.
 
-    Extends the base KERI LMDBer with four sub-databases:
+    Extends the base KERI LMDBer with five sub-databases:
         - ``ips``: per-IP request-rate records keyed by IP address string
         - ``wats``: watcher records keyed by watcher AID
         - ``cids``: controller-AID-to-datetime-processed index keyed by (watcher AID, controller AID)
         - ``witq``: most recent witness query records keyed by (watcher AID, observed AID, witness AID)
+        - ``krpy``: said of the last accepted ``/ksn`` reply keyed by (observed AID, source AID)
     """
 
     TailDirPath = "keri/watopnet"
@@ -96,6 +97,7 @@ class Baser(dbing.LMDBer):
         self.wats = None
         self.cids = None
         self.witq = None
+        self.krpy = None
 
         super(Baser, self).__init__(
             name=name, headDirPath=headDirPath, reopen=reopen, **kwa
@@ -109,5 +111,6 @@ class Baser(dbing.LMDBer):
         self.wats = koming.Komer(db=self, subkey="wats.", schema=Wat)
         self.cids = subing.CesrSuber(db=self, subkey="cids.", klas=coring.Dater)
         self.witq = koming.Komer(db=self, subkey="witq.", schema=WitnessQuery)
+        self.krpy = subing.CesrSuber(db=self, subkey="krpy.", klas=coring.Saider)
 
         return self.env

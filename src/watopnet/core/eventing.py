@@ -101,3 +101,42 @@ class QueryKeveryShim:
 
         kvy = eventing.Kevery(db=self.watcher.hab.db, local=False, cues=self.cues)
         kvy.processQuery(serder=serder, source=source, sigers=sigers, cigars=cigars)
+
+
+class PruningKevery(eventing.Kevery):
+    """Kevery that drops the ``/ksn`` reply records keripy leaves behind.
+
+    ``processReplyKeyStateNotice`` hands ``acceptReply`` the saider from ``knas``, which
+    holds the KEL event digest rather than the previous reply's said, so the
+    ``removeReply`` inside BADA matches nothing and ``rpys``/``sdts``/``scgs`` gain a
+    record per witness per poll. Tracking the said ourselves makes the removal land.
+    """
+
+    def __init__(self, wdb, **kwa):
+        """
+        Parameters:
+            wdb (Baser): watopnet database holding the last accepted reply said
+            **kwa: keyword arguments forwarded to Kevery
+        """
+        self.wdb = wdb
+        super(PruningKevery, self).__init__(**kwa)
+
+    def processReplyKeyStateNotice(
+        self, *, serder, saider, route, cigars=None, tsgs=None, **kwargs
+    ):
+        """Process a key state notice reply, then remove the reply it supersedes."""
+        aid = kwargs["aid"]
+        pre = serder.ked["a"].get("i")
+        keys = (pre, aid)
+        prior = self.wdb.krpy.get(keys=keys) if pre else None
+
+        super(PruningKevery, self).processReplyKeyStateNotice(
+            serder=serder, saider=saider, route=route, cigars=cigars, tsgs=tsgs, **kwargs
+        )
+
+        if pre is None:
+            return
+
+        if prior is not None and prior.qb64 != saider.qb64:
+            self.rvy.removeReply(prior)
+        self.wdb.krpy.pin(keys=keys, val=saider)

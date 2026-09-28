@@ -23,6 +23,7 @@ from watopnet.app.watching import (
     CueDoer,
     ResponseDoer,
     Sentinal,
+    SentinalDoer,
     States,
     Watcher,
     Watchery,
@@ -701,3 +702,24 @@ def test_sentinal_recovers_from_the_ahead_witness(monkeypatch):
     query = recovery[0].witq.msgs[0]
     assert query["wits"] == ["WIT_2"]
     assert query["q"] == {"s": "2", "fn": "4"}
+
+
+def test_sentinal_doer_releases_finished_sentinals():
+    empty = SimpleNamespace(getItemIter=lambda keys: iter(()))
+    db = SimpleNamespace(cids=empty)
+    hby = SimpleNamespace(db=SimpleNamespace(obvs=empty))
+    hab = SimpleNamespace(pre="WATCHER_AID")
+
+    doer = SentinalDoer(
+        db=db, hby=hby, hab=hab, cid=CONTROLLER_AID, oobi="http://watcher/oobi"
+    )
+
+    finished = doing.Doer()
+    finished.done = True
+    doer.sentinals["OBSERVED_AID"] = finished
+    doer.doers.append(finished)
+
+    doer.recur(tyme=0.0)
+
+    assert "OBSERVED_AID" not in doer.sentinals
+    assert finished not in doer.doers

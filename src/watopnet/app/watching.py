@@ -31,6 +31,7 @@ from keri.peer import exchanging
 from keri.vdr import verifying
 from keri.vdr.eventing import Tevery
 from watopnet.core import basing, httping, oobing
+from watopnet.core.eventing import PruningKevery
 from watopnet.core.httping import HttpEnd
 
 logger = help.ogler.getLogger()
@@ -416,7 +417,8 @@ class Watcher(doing.DoDoer):
         )
 
         #  needs unique kevery with ims per remoter connnection
-        self.kvy = eventing.Kevery(
+        self.kvy = PruningKevery(
+            wdb=self.db,
             db=self.hby.db,
             cues=self.cues,
             rvy=self.rvy,
@@ -546,6 +548,7 @@ class SentinalDoer(doing.DoDoer):
         for wid, sentinal in list(self.sentinals.items()):
             if sentinal.done:
                 del self.sentinals[wid]
+                self.remove([sentinal])  # hio drops the deed but keeps the doer
 
         return super(SentinalDoer, self).recur(tyme, deeds=None)
 
